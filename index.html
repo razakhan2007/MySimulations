@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>EOQ — Sawtooth Fix</title>
+<script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+<style>
+  body {
+    font-family: "Segoe UI", Arial, sans-serif;
+    margin: 20px;
+    background-color: #f8f9fb;
+    color: #222;
+  }
+  h1 { text-align: center; margin-bottom: 8px; }
+  .input-container {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  label { font-weight: 600; font-size: 13px; display:block; }
+  input[type="number"] { width:100%; padding:6px; margin-top:6px; font-size:14px; }
+  .slider-container { margin-top:10px; }
+  input[type="range"] { width:100%; }
+  .output { text-align:center; font-weight:700; margin:10px 0; }
+  .graph-container { display: grid; grid-template-columns: 70% 30%; gap: 18px; }
+  @media (max-width:900px) { .graph-container { grid-template-columns: 1fr; } }
+  #inventoryProfile, #costBars { width:100%; height:420px; }
+</style>
+</head>
+<body>
+
+<h1>Economic Order Quantity (EOQ) — Sawtooth Corrected</h1>
+
+<div class="input-container">
+  <div>
+    <label for="orderCost">Cost per Order (S)</label>
+    <input id="orderCost" type="number" value="50" step="1" />
+  </div>
+  <div>
+    <label for="holdingCost">Holding Cost per Unit (H)</label>
+    <input id="holdingCost" type="number" value="2" step="0.1" />
+  </div>
+  <div>
+    <label for="annualDemand">Annual Demand (D)</label>
+    <input id="annualDemand" type="number" value="1000" step="10" />
+  </div>
+</div>
+
+<div class="slider-container">
+  <label for="orderQuantity">Adjust Order Quantity (Q)</label>
+  <input id="orderQuantity" type="range" min="10" max="1000" step="10" value="200" />
+  <div class="output" id="eoqOutput"></div>
+</div>
+
+<div class="graph-container">
+  <div id="inventoryProfile"></div>
+  <div id="costBars"></div>
+</div>
+
+<script>
+function buildSawtooth(Q, D, pointsPerCycle = 40) {
+  // Q = order quantity (units)
+  // D = annual demand (units/year)
+  // returns arrays x (0..1 year) and y (inventory)
+  const cycleTime = Q / D; // years per cycle
+  const x = [];
+  const y = [];
+
+  // If cycleTime is extremely small or zero, handle gracefully:
+  if (!isFinite(cycleTime) || cycleTime <= 0) {
+    // flat zero inventory
+    x.push(0, 1);
+    y.push(0, 0);
+    return { x, y };
+  }
+
+  // Number of complete cycles that fit fully in one year
+  const fullCycles = Math.floor(1 / cycleTime);
+
+  // For each full cycle, create a linear decline from Q to 0 sampled at pointsPerCycle
+  for (let c = 0; c < fullCycles; c++) {
+    const start = c * cycleTime;
+    for (let p = 0; p <= pointsPerCycle; p++) {
+      const frac = p / pointsPerCycle; // 0..1
+      const t = start + frac * cycleTime;
+      // avoid pushing points beyond 1.0
+      if (t > 1 + 1e-12) break;
+      x.push(+t.toFixed(6));
+      y.push(Math.max(Q * (1 - frac), 0));
+    }
+  }
+
+  // Handle final partial cycle if any (from end of last full cycle to t=1)
+  const lastFullEnd = fullCycles * cycleTime;
+  if (lastFullEnd < 1 - 1e-12) {
+    const remaining = 1 - lastFullEnd;
+    // sample remaining segment from inventory at start of partial cycle down to inventory at t=1
+    // inventory at fraction f of cycle (f between 0 and remaining/cycleTime)
+    const maxFrac = remaining / cycleTime; // < 1
+    for (let p = 0; p <= Math.max(2, Math.ceil(pointsPerCycle * maxFrac)); p++) {
+      const frac = (p / Math.max(2, Math.ceil(pointsPerCycle * maxFrac))) * maxFrac;
+      const t = lastFullEnd + frac * cycleTime;
+      x.push(+t.toFixed(6));
+      y.push(Math.max(Q * (1 - frac), 0));
+    }
+  }
+
+  // Ensure the arrays start at 0 and end at 1 for consistent plotting
+  if (x.length === 0 || x[0] > 1e-9) { x.unshift(0); y.unshift(Q); }
+  if (x[x.length - 1] < 1 - 1e-9) { x.push(1); 
+    // compute inventory at t=1 (if inside partial cycle, computed above; else zero)
+    const cyclesInYear = 1 / cycleTime;
+    const fracAtEnd = (1 % cycleTime) / cycleTime; // but simpler:
+    const inventoryAtEnd = (() => {
+      if (fullCycles * cycleTime === 1) return 0;
+      const remaining = 1 - fullCycles * cycleTime;
+      if (remaining <= 1e-12) return 0;
+      const frac = remaining / cycleTime;
+      return Math.max(Q * (1 - frac), 0);
+    })();
+    y.push(inventoryAtEnd);
+  }
+
+  return { x, y };
+}
+
+function updateGraphs() {
+  const S = parseFloat(document.getElementById("orderCost").value) || 0;
+  const H = parseFloat(document.getElementById("holdingCost").value) || 0.000001; // avoid div by zero
+  const D = parseFloat(document.getElementById("annualDemand").value) || 0;
+  const Q = parseFloat(document.getElementById("orderQuantity").value) || 1;
+
+  const EOQ = Math.sqrt((2 * D * S) / H);
+
+  // Build sawtooth arrays
+  const ptsPerCycle = 40; // controls smoothness of each linear decline
+  const saw = buildSawtooth(Q, D, ptsPerCycle);
+
+  const inventoryTrace = {
+    x: saw.x,
+    y: saw.y,
+    mode: "lines",
+    line: { color: "royalblue", width: 2 },
+    fill: "tozeroy",
+    name: "Inventory Level"
+  };
+
+  const inventoryLayout = {
+    title: "Inventory Profile Over One Year",
+    xaxis: { title: "Time (years)", range: [0, 1], tick0: 0, dtick: 0.1 },
+    yaxis: { title: "Inventory Level", rangemode: "tozero" },
+    margin: { t: 50, r: 10, b: 50, l: 50 },
+    template: "plotly_white",
+    showlegend: false
+  };
+
+  Plotly.newPlot("inventoryProfile", [inventoryTrace], inventoryLayout, {responsive: true});
+
+  // Costs
+  const orderingCost = (D / Q) * S;
+  const holdingCost = (Q / 2) * H;
+  const totalCost = orderingCost + holdingCost;
+
+  const costTrace = {
+    x: ["Ordering", "Holding"],
+    y: [orderingCost, holdingCost],
+    type: "bar",
+    text: [orderingCost.toFixed(2), holdingCost.toFixed(2)],
+    textposition: "auto",
+    marker: { color: ["#ffa15a", "#19d3f3"] },
+    width: 0.35
+  };
+
+  const costLayout = {
+    title: `Annual Costs (Total = ${totalCost.toFixed(2)})`,
+    yaxis: { title: "Cost ($)" },
+    margin: { t: 50, r: 10, b: 50, l: 40 },
+    template: "plotly_white",
+    height: 420,
+    showlegend: false
+  };
+
+  Plotly.newPlot("costBars", [costTrace], costLayout, {responsive: true});
+
+  document.getElementById("eoqOutput").textContent =
+    `Calculated EOQ = ${isFinite(EOQ) ? EOQ.toFixed(2) : "—"} units | Current Q = ${Q} units`;
+}
+
+// wire up inputs
+document.querySelectorAll("input").forEach(el => el.addEventListener("input", updateGraphs));
+
+// initial draw
+updateGraphs();
+</script>
+
+</body>
+</html>
+
